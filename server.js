@@ -5,13 +5,12 @@ const { WebSocketServer, WebSocket } = require('ws');
 const app = express();
 const server = http.createServer(app);
 
-// トンネル専用のパス '/tunnel' を指定
+// トンネル用のWebSocketサーバー
 const wss = new WebSocketServer({ server, path: '/tunnel' });
 
 let localWs = null;
 const pendingRequests = new Map();
 
-// 定期的な接続生存確認（Ping/Pong）
 function heartbeat() {
     this.isAlive = true;
 }
@@ -52,7 +51,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-// 20秒ごとにPingを送信してRenderのタイムアウトを防ぐ
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) return ws.terminate();
@@ -67,6 +65,7 @@ wss.on('close', () => {
 
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
+// 通常のHTTPリクエスト、および Socket.io のHTTP/WebSocketハンドシェイクもまとめて自宅へ転送
 app.use((req, res) => {
     if (!localWs || localWs.readyState !== WebSocket.OPEN) {
         return res.status(503).send('Tunnel to local PC is not connected.');
@@ -77,6 +76,7 @@ app.use((req, res) => {
 
     req.on('close', () => {
         if (pendingRequests.has(requestId)) {
+            pendingRequests.pendingRequests = undefined;
             pendingRequests.delete(requestId);
         }
     });
