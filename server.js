@@ -1,394 +1,618 @@
-const express = require('express');
-const http = require('http');
+const express = require("express");
+const http = require("http");
 const {
     WebSocketServer,
     WebSocket
-} = require('ws');
+} = require("ws");
+
+// ============================================================
+// 基本設定
+// ============================================================
 
 const app = express();
 const server = http.createServer(app);
 
-// =========================================================
-// 設定
-// =========================================================
-
 const PORT =
-    process.env.PORT || 3000;
+    Number(process.env.PORT) || 3000;
 
 const TUNNEL_PATH =
-    '/tunnel';
+    "/tunnel";
 
 const SOCKET_PATH =
-    '/ws/socket.io/';
+    "/ws/socket.io";
 
-// =========================================================
+// ============================================================
+// 状態
+// ============================================================
+
+let localTunnel = null;
+
+const pendingHttp =
+    new Map();
+
+const browserSockets =
+    new Map();
+
+// ============================================================
 // HTTP body
-// =========================================================
+// ============================================================
 
 app.use(
     express.raw({
-        type: '*/*',
-        limit: '50mb'
+        type: "*/*",
+        limit: "50mb"
     })
 );
 
-// =========================================================
-// Local PC Tunnel
-// =========================================================
+// ============================================================
+// WebSocketServer
+// ============================================================
 
 const tunnelWss =
     new WebSocketServer({
-        noServer: true
+        noServer: true,
+        perMessageDeflate: false
     });
-
-// =========================================================
-// Browser WebSocket
-// =========================================================
 
 const browserWss =
     new WebSocketServer({
-        noServer: true
+        noServer: true,
+        perMessageDeflate: false
     });
 
-let localWs = null;
+// ============================================================
+// Tunnel helper
+// ============================================================
 
-const pendingHttpRequests =
-    new Map();
+function tunnelIsOpen() {
 
-const pendingBrowserSockets =
-    new Map();
+    return (
+        localTunnel &&
+        localTunnel.readyState ===
+            WebSocket.OPEN
+    );
+}
 
+function sendToLocal(message) {
 
-// =========================================================
+    if (!tunnelIsOpen()) {
+
+        console.error(
+            "[TUNNEL] Local tunnel is not connected"
+        );
+
+        return false;
+    }
+
+    try {
+
+        localTunnel.send(
+            JSON.stringify(message)
+        );
+
+        return true;
+
+    } catch (error) {
+
+        console.error(
+            "[TUNNEL SEND ERROR]",
+            error.message
+        );
+
+        return false;
+    }
+}
+
+// ============================================================
 // Tunnel connection
-// =========================================================
+// ============================================================
 
 tunnelWss.on(
-    'connection',
+    "connection",
     (ws) => {
 
         console.log(
-            '[TUNNEL] Local PC connected'
+            "[TUNNEL] Local PC connected"
         );
 
-        localWs = ws;
-
-        ws.isAlive = true;
-
-        ws.on('pong', () => {
-            ws.isAlive = true;
-        });
-
-        ws.on('message', (rawMessage) => {
-
-            let msg;
+        // 既存接続を切断
+        if (
+            localTunnel &&
+            localTunnel !== ws
+        ) {
 
             try {
-                msg =
-                    JSON.parse(
-                        rawMessage.toString()
-                    );
-            } catch (err) {
+                localTunnel.close();
+            } catch {}
+        }
 
-                console.error(
-                    '[TUNNEL] Invalid JSON:',
-                    err.message
-                );
+        localTunnel = ws;
 
-                return;
-            }
+        ws.on(
+            "message",
+            (raw) => {
 
-            // =================================================
-            // HTTP response
-            // =================================================
+                let message;
 
-            if (
-                msg.type === 'response_start' ||
-                msg.type === 'response_data' ||
-                msg.type === 'response_end'
-            ) {
+                try {
 
-                const res =
-                    pendingHttpRequests.get(
-                        msg.id
+                    message =
+                        JSON.parse(
+                            raw.toString()
+                        );
+
+                } catch (error) {
+
+                    console.error(
+                        "[TUNNEL JSON ERROR]",
+                        error.message
                     );
 
-                if (!res) {
+                    return;
+                }
+
+                // ==================================================
+                // HTTP response
+                // ==================================================
+
+                if (
+                    message.type ===
+                    "http_response_start"
+                ) {
+
+                    const res =
+                        pendingHttp.get(
+                            message.id
+                        );
+
+                    if (!res) {
+                        return;
+                    }
+
+                    const headers = {
+                        ...(message.headers || {})
+                    };
+
+                    delete headers.connection;
+                    delete headers["transfer-encoding"];
+
+                    try {
+
+                        res.writeHead(
+                            message.status,
+                            headers
+                        );
+
+                    } catch (error) {
+
+                        console.error(
+                            "[HTTP HEAD ERROR]",
+                            error.message
+                        );
+                    }
+
                     return;
                 }
 
                 if (
-                    msg.type ===
-                    'response_start'
+                    message.type ===
+                    "http_response_data"
                 ) {
 
-                    const headers = {
-                        ...(msg.headers || {})
-                    };
-
-                    delete headers[
-                        'transfer-encoding'
-                    ];
-
-                    delete headers.connection;
-
-                    try {
-                        res.writeHead(
-                            msg.status,
-                            headers
+                    const res =
+                        pendingHttp.get(
+                            message.id
                         );
-                    } catch (err) {
-                        console.error(
-                            '[HTTP] writeHead error:',
-                            err.message
-                        );
+
+                    if (!res) {
+                        return;
                     }
 
-                } else if (
-                    msg.type ===
-                    'response_data'
-                ) {
-
                     try {
+
                         res.write(
                             Buffer.from(
-                                msg.chunk,
-                                'base64'
+                                message.chunk,
+                                "base64"
                             )
                         );
-                    } catch (err) {
+
+                    } catch (error) {
+
                         console.error(
-                            '[HTTP] write error:',
-                            err.message
+                            "[HTTP DATA ERROR]",
+                            error.message
                         );
                     }
 
-                } else {
+                    return;
+                }
+
+                if (
+                    message.type ===
+                    "http_response_end"
+                ) {
+
+                    const res =
+                        pendingHttp.get(
+                            message.id
+                        );
+
+                    if (!res) {
+                        return;
+                    }
 
                     try {
                         res.end();
                     } catch {}
 
-                    pendingHttpRequests.delete(
-                        msg.id
-                    );
-                }
-
-                return;
-            }
-
-            // =================================================
-            // Browser WebSocket
-            // =================================================
-
-            if (
-                msg.type === 'ws_open' ||
-                msg.type === 'ws_response' ||
-                msg.type === 'ws_close' ||
-                msg.type === 'ws_error'
-            ) {
-
-                const clientWs =
-                    pendingBrowserSockets.get(
-                        msg.id
+                    pendingHttp.delete(
+                        message.id
                     );
 
-                if (!clientWs) {
                     return;
                 }
 
+                // ==================================================
+                // WebSocket OPEN
+                // ==================================================
+
                 if (
-                    msg.type === 'ws_open'
+                    message.type ===
+                    "ws_open"
                 ) {
 
                     console.log(
-                        `[WS] Local connection opened: ${msg.id}`
+                        `[WS OPEN] ${message.id}`
                     );
 
                     return;
                 }
 
+                // ==================================================
+                // WebSocket MESSAGE
+                // ==================================================
+
                 if (
-                    msg.type === 'ws_response'
+                    message.type ===
+                    "ws_message"
                 ) {
 
+                    const browserWs =
+                        browserSockets.get(
+                            message.id
+                        );
+
+                    if (!browserWs) {
+                        return;
+                    }
+
                     if (
-                        clientWs.readyState ===
+                        browserWs.readyState !==
                         WebSocket.OPEN
                     ) {
+                        return;
+                    }
 
-                        clientWs.send(
+                    try {
+
+                        const buffer =
                             Buffer.from(
-                                msg.chunk,
-                                'base64'
-                            )
+                                message.chunk,
+                                "base64"
+                            );
+
+                        console.log(
+                            `[WS → BROWSER] ${buffer.length} bytes binary=${message.binary === true}`
+                        );
+
+                        if (
+                            message.binary === true
+                        ) {
+
+                            browserWs.send(
+                                buffer,
+                                {
+                                    binary: true
+                                }
+                            );
+
+                        } else {
+
+                            browserWs.send(
+                                buffer.toString(),
+                                {
+                                    binary: false
+                                }
+                            );
+                        }
+
+                    } catch (error) {
+
+                        console.error(
+                            "[WS → BROWSER ERROR]",
+                            error.message
                         );
                     }
 
                     return;
                 }
 
+                // ==================================================
+                // WebSocket ERROR
+                // ==================================================
+
                 if (
-                    msg.type === 'ws_error'
+                    message.type ===
+                    "ws_error"
                 ) {
 
+                    const browserWs =
+                        browserSockets.get(
+                            message.id
+                        );
+
                     console.error(
-                        `[WS ERROR] ${msg.id}:`,
-                        msg.error
+                        `[WS ERROR] ${message.id}: ${message.error}`
                     );
 
-                    try {
-                        clientWs.close();
-                    } catch {}
+                    if (browserWs) {
 
-                    pendingBrowserSockets.delete(
-                        msg.id
+                        try {
+
+                            browserWs.close(
+                                1011,
+                                "Local WebSocket error"
+                            );
+
+                        } catch {}
+                    }
+
+                    browserSockets.delete(
+                        message.id
                     );
 
                     return;
                 }
 
+                // ==================================================
+                // WebSocket CLOSE
+                // ==================================================
+
                 if (
-                    msg.type === 'ws_close'
+                    message.type ===
+                    "ws_close"
+                ) {
+
+                    const browserWs =
+                        browserSockets.get(
+                            message.id
+                        );
+
+                    if (!browserWs) {
+                        return;
+                    }
+
+                    console.log(
+                        `[WS CLOSE] ${message.id}`
+                    );
+
+                    try {
+
+                        browserWs.close(
+                            message.code || 1000,
+                            message.reason || ""
+                        );
+
+                    } catch {}
+
+                    browserSockets.delete(
+                        message.id
+                    );
+
+                    return;
+                }
+            }
+        );
+
+        // ==================================================
+        // Tunnel close
+        // ==================================================
+
+        ws.on(
+            "close",
+            (code, reason) => {
+
+                console.log(
+                    `[TUNNEL CLOSED] code=${code} reason=${reason.toString()}`
+                );
+
+                if (
+                    localTunnel === ws
+                ) {
+
+                    localTunnel = null;
+                }
+
+                // HTTPを終了
+                for (
+                    const [id, res]
+                    of pendingHttp
                 ) {
 
                     try {
-                        clientWs.close();
+
+                        if (!res.headersSent) {
+
+                            res.statusCode =
+                                502;
+
+                            res.end(
+                                "Local tunnel disconnected."
+                            );
+
+                        } else {
+
+                            res.end();
+                        }
+
                     } catch {}
 
-                    pendingBrowserSockets.delete(
-                        msg.id
+                    pendingHttp.delete(
+                        id
+                    );
+                }
+
+                // Browser WSを終了
+                for (
+                    const [id, browserWs]
+                    of browserSockets
+                ) {
+
+                    try {
+
+                        browserWs.close(
+                            1011,
+                            "Local tunnel disconnected"
+                        );
+
+                    } catch {}
+
+                    browserSockets.delete(
+                        id
                     );
                 }
             }
-        });
+        );
 
-        ws.on('close', () => {
+        ws.on(
+            "error",
+            (error) => {
 
-            console.log(
-                '[TUNNEL] Local PC disconnected'
-            );
-
-            if (localWs === ws) {
-                localWs = null;
-            }
-
-            for (
-                const [id, clientWs]
-                of pendingBrowserSockets
-            ) {
-
-                try {
-                    clientWs.close();
-                } catch {}
-
-                pendingBrowserSockets.delete(
-                    id
+                console.error(
+                    "[TUNNEL ERROR]",
+                    error.message
                 );
             }
-        });
+        );
 
-        ws.on('error', (err) => {
-
-            console.error(
-                '[TUNNEL] Error:',
-                err.message
-            );
-        });
+        ws.on(
+            "ping",
+            () => {
+                try {
+                    ws.pong();
+                } catch {}
+            }
+        );
     }
 );
 
-
-// =========================================================
-// HTTP → Local PC
-// =========================================================
+// ============================================================
+// HTTP proxy
+// ============================================================
 
 app.use(
     (req, res) => {
 
-        if (
-            !localWs ||
-            localWs.readyState !==
-            WebSocket.OPEN
-        ) {
+        console.log(
+            `[HTTP] ${req.method} ${req.originalUrl}`
+        );
+
+        if (!tunnelIsOpen()) {
 
             return res
                 .status(503)
                 .send(
-                    'Tunnel to local PC is not connected.'
+                    "Tunnel to local PC is not connected."
                 );
         }
 
-        const requestId =
+        const id =
+            "http_" +
             Math.random()
                 .toString(36)
-                .substring(2) +
-            Date.now()
-                .toString(36);
+                .slice(2) +
+            Date.now().toString(36);
 
-        pendingHttpRequests.set(
-            requestId,
+        pendingHttp.set(
+            id,
             res
         );
 
-        const bodyBase64 =
+        const body =
             req.body &&
             Buffer.isBuffer(req.body)
-                ? req.body.toString('base64')
-                : '';
+                ? req.body.toString("base64")
+                : "";
 
-        const message = {
-            type: 'request',
-            id: requestId,
-            method: req.method,
-            url: req.originalUrl,
-            headers: req.headers,
-            body: bodyBase64
+        const headers = {
+            ...req.headers
         };
 
-        try {
+        /*
+         * Render→Localで不要なhop-by-hop headers
+         */
+        delete headers.connection;
+        delete headers.upgrade;
+        delete headers["proxy-connection"];
+        delete headers["keep-alive"];
+        delete headers["transfer-encoding"];
 
-            localWs.send(
-                JSON.stringify(message)
-            );
+        const sent =
+            sendToLocal({
+                type: "http_request",
+                id,
+                method: req.method,
+                url: req.originalUrl,
+                headers,
+                body
+            });
 
-        } catch (err) {
+        if (!sent) {
 
-            pendingHttpRequests.delete(
-                requestId
-            );
+            pendingHttp.delete(id);
 
-            return res
-                .status(502)
-                .send(
-                    'Failed to send request to local PC.'
+            if (!res.headersSent) {
+                res.status(503).send(
+                    "Local tunnel unavailable."
                 );
+            }
         }
     }
 );
 
-
-// =========================================================
+// ============================================================
 // WebSocket Upgrade
-// =========================================================
+// ============================================================
 
 server.on(
-    'upgrade',
+    "upgrade",
     (request, socket, head) => {
 
-        const url =
-            new URL(
-                request.url,
-                `http://${request.headers.host}`
-            );
+        let url;
+
+        try {
+
+            url =
+                new URL(
+                    request.url,
+                    `http://${request.headers.host || "localhost"}`
+                );
+
+        } catch {
+
+            socket.destroy();
+
+            return;
+        }
 
         console.log(
             `[UPGRADE] ${url.pathname}${url.search}`
         );
 
-        // =====================================================
-        // Local PC Tunnel
-        // =====================================================
+        // ==================================================
+        // Tunnel
+        // ==================================================
 
         if (
             url.pathname ===
@@ -402,7 +626,7 @@ server.on(
                 (ws) => {
 
                     tunnelWss.emit(
-                        'connection',
+                        "connection",
                         ws,
                         request
                     );
@@ -412,19 +636,24 @@ server.on(
             return;
         }
 
-        // =====================================================
-        // Browser WebSocket
-        // =====================================================
+        // ==================================================
+        // Open WebUI Socket.IO
+        // ==================================================
+
+        const normalizedSocketPath =
+            url.pathname.endsWith("/")
+                ? url.pathname.slice(0, -1)
+                : url.pathname;
 
         if (
-            url.pathname !==
+            normalizedSocketPath !==
             SOCKET_PATH
         ) {
 
             socket.write(
-                'HTTP/1.1 404 Not Found\r\n' +
-                'Connection: close\r\n' +
-                '\r\n'
+                "HTTP/1.1 404 Not Found\r\n" +
+                "Connection: close\r\n" +
+                "\r\n"
             );
 
             socket.destroy();
@@ -432,36 +661,37 @@ server.on(
             return;
         }
 
-        // =====================================================
-        // Tunnel check
-        // =====================================================
+        // ==================================================
+        // Local tunnel check
+        // ==================================================
 
-        if (
-            !localWs ||
-            localWs.readyState !==
-            WebSocket.OPEN
-        ) {
+        if (!tunnelIsOpen()) {
 
             socket.write(
-                'HTTP/1.1 503 Service Unavailable\r\n' +
-                'Connection: close\r\n' +
-                '\r\n'
+                "HTTP/1.1 503 Service Unavailable\r\n" +
+                "Connection: close\r\n" +
+                "\r\n" +
+                "Local tunnel is not connected."
             );
 
             socket.destroy();
 
             return;
         }
+
+        // ==================================================
+        // Browser WebSocket
+        // ==================================================
 
         browserWss.handleUpgrade(
             request,
             socket,
             head,
-            (clientWs) => {
+            (browserWs) => {
 
                 browserWss.emit(
-                    'connection',
-                    clientWs,
+                    "connection",
+                    browserWs,
                     request
                 );
             }
@@ -469,45 +699,39 @@ server.on(
     }
 );
 
-
-// =========================================================
+// ============================================================
 // Browser WebSocket connection
-// =========================================================
+// ============================================================
 
 browserWss.on(
-    'connection',
-    (clientWs, request) => {
+    "connection",
+    (browserWs, request) => {
 
-        const requestId =
-            'ws_' +
+        const id =
+            "ws_" +
             Math.random()
                 .toString(36)
-                .substring(2) +
-            Date.now()
-                .toString(36);
+                .slice(2) +
+            Date.now().toString(36);
 
         console.log(
-            `[BROWSER WS] Connected: ${request.url}`
+            `[BROWSER WS CONNECT] ${request.url}`
         );
 
-        pendingBrowserSockets.set(
-            requestId,
-            clientWs
+        browserSockets.set(
+            id,
+            browserWs
         );
 
-        // =====================================================
-        // Browser → Local PC
-        // =====================================================
+        // ==================================================
+        // Browser → Local
+        // ==================================================
 
-        clientWs.on(
-            'message',
+        browserWs.on(
+            "message",
             (data, isBinary) => {
 
-                if (
-                    !localWs ||
-                    localWs.readyState !==
-                    WebSocket.OPEN
-                ) {
+                if (!tunnelIsOpen()) {
                     return;
                 }
 
@@ -516,163 +740,150 @@ browserWss.on(
                         ? data
                         : Buffer.from(data);
 
-                localWs.send(
-                    JSON.stringify({
-                        type: 'ws_request',
-                        id: requestId,
-                        chunk:
-                            buffer.toString(
-                                'base64'
-                            ),
-                        binary: !!isBinary
-                    })
+                console.log(
+                    `[BROWSER → LOCAL] ${buffer.length} bytes binary=${Boolean(isBinary)}`
                 );
+
+                sendToLocal({
+                    type: "ws_message",
+                    id,
+                    binary: Boolean(isBinary),
+                    chunk:
+                        buffer.toString("base64")
+                });
             }
         );
 
-        // =====================================================
+        // ==================================================
         // Browser close
-        // =====================================================
+        // ==================================================
 
-        clientWs.on(
-            'close',
-            () => {
+        browserWs.on(
+            "close",
+            (code, reason) => {
 
                 console.log(
-                    `[BROWSER WS] Closed: ${requestId}`
+                    `[BROWSER WS CLOSE] id=${id} code=${code} reason=${reason.toString()}`
                 );
 
-                if (
-                    localWs &&
-                    localWs.readyState ===
-                    WebSocket.OPEN
-                ) {
+                if (tunnelIsOpen()) {
 
-                    localWs.send(
-                        JSON.stringify({
-                            type: 'ws_close',
-                            id: requestId
-                        })
-                    );
+                    sendToLocal({
+                        type: "ws_close",
+                        id,
+                        code,
+                        reason:
+                            reason.toString()
+                    });
                 }
 
-                pendingBrowserSockets.delete(
-                    requestId
+                browserSockets.delete(
+                    id
                 );
             }
         );
 
-        clientWs.on(
-            'error',
-            (err) => {
+        // ==================================================
+        // Browser error
+        // ==================================================
+
+        browserWs.on(
+            "error",
+            (error) => {
 
                 console.error(
-                    `[BROWSER WS ERROR] ${requestId}:`,
-                    err.message
+                    `[BROWSER WS ERROR] ${id}`,
+                    error.message
                 );
             }
         );
 
-        // =====================================================
-        // Local PCへ接続要求
-        // =====================================================
+        // ==================================================
+        // Localへ接続要求
+        // ==================================================
 
-        localWs.send(
-            JSON.stringify({
-                type: 'ws_connect',
-                id: requestId,
-                url: request.url,
-                headers: request.headers
-            })
-        );
+        sendToLocal({
+            type: "ws_connect",
+            id,
+            url: request.url,
+            headers: request.headers
+        });
     }
 );
 
-
-// =========================================================
-// Health
-// =========================================================
+// ============================================================
+// Health check
+// ============================================================
 
 app.get(
-    '/health',
+    "/health",
     (req, res) => {
 
         res.json({
             status: true,
             tunnel:
-                !!localWs &&
-                localWs.readyState ===
-                WebSocket.OPEN,
+                tunnelIsOpen(),
             httpPending:
-                pendingHttpRequests.size,
+                pendingHttp.size,
             websocketPending:
-                pendingBrowserSockets.size
+                browserSockets.size
         });
     }
 );
 
-
-// =========================================================
-// Heartbeat
-// =========================================================
+// ============================================================
+// Render側 heartbeat
+// ============================================================
 
 setInterval(
     () => {
 
         if (
-            localWs &&
-            localWs.readyState ===
-            WebSocket.OPEN
+            localTunnel &&
+            localTunnel.readyState ===
+                WebSocket.OPEN
         ) {
 
-            if (localWs.isAlive === false) {
-
-                console.log(
-                    '[TUNNEL] Heartbeat timeout'
-                );
-
-                localWs.terminate();
-
-                return;
-            }
-
-            localWs.isAlive = false;
-
-            localWs.ping();
+            try {
+                localTunnel.ping();
+            } catch {}
         }
 
     },
     20000
 );
 
-
-// =========================================================
+// ============================================================
 // Start
-// =========================================================
+// ============================================================
 
 server.listen(
     PORT,
-    '0.0.0.0',
+    "0.0.0.0",
     () => {
 
         console.log(
-            '================================='
+            "========================================"
         );
 
         console.log(
-            `Render Tunnel Server listening on ${PORT}`
+            "School AI Render Tunnel"
         );
 
         console.log(
-            `Tunnel path: ${TUNNEL_PATH}`
+            `Port: ${PORT}`
         );
 
         console.log(
-            `Socket path: ${SOCKET_PATH}`
+            `Tunnel: ${TUNNEL_PATH}`
         );
 
         console.log(
-            '================================='
+            `Socket.IO: ${SOCKET_PATH}`
+        );
+
+        console.log(
+            "========================================"
         );
     }
 );
