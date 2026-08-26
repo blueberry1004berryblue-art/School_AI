@@ -1,10 +1,3 @@
-// ============================================================
-// 基本情報
-// schoolaccout@schoolaccount.com // 0000
-// test@test.com // 0000
-// ============================================================
-
-
 const express = require("express");
 const http = require("http");
 const {
