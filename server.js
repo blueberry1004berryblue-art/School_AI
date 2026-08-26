@@ -65,6 +65,12 @@ function generateHtml(type, msg) {
         }
         .container::before { top: -2px; left: -2px; border-right: none; border-bottom: none; }
         .container::after { bottom: -2px; right: -2px; border-left: none; border-top: none; }
+        @media screen and (max-width: 768px) {
+            .container {
+                width: 85%;       /* 画面幅に合わせて横幅を自動調整 */
+                padding: 20px;    /* 内部の余白を狭くする */
+            }
+        }
 
         h1 {
             font-size: 2.5rem; letter-spacing: 5px; margin: 0 0 20px;
